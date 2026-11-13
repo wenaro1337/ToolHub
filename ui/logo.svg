@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="currentColor">
+  <!-- Square 1 (Top-Left hollow square) -->
+  <path fill-rule="evenodd" d="M0 0h362v362H0V0zm60 60h241v241H60V60z"/>
+  <!-- Square 2 (Bottom-Right hollow square) -->
+  <path fill-rule="evenodd" d="M151 151h361v361H151V151zm60 60h241v241H211V211z"/>
+  <!-- Center overlap solid square -->
+  <rect x="151" y="151" width="211" height="211"/>
+</svg>

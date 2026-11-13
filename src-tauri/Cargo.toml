@@ -1,0 +1,29 @@
+[package]
+name = "toolhub"
+version = "0.2.3"
+description = "ToolHub - Local Media & AI Automation Studio"
+authors = ["ToolHub Team"]
+edition = "2021"
+
+[lib]
+name = "toolhub_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0.0" }
+
+[dependencies]
+tauri = { version = "2.0.0", features = ["devtools", "tray-icon"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sysinfo = "0.31"
+uuid = { version = "1.10", features = ["v4", "fast-rng"] }
+sha2 = "0.10"
+walkdir = "2.5"
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+dirs = "5.0"
+tauri-plugin-updater = "2.14.1"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"

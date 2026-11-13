@@ -1,0 +1,29 @@
+# Rust build artifacts
+src-tauri/target/
+**/*.rs.bk
+
+# Python artifacts (legacy)
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# ToolHub runtime output and caches
+toolhub_output/
+cache/
+uploads/
+
+# Executables & binary builds
+*.exe
+*.exe.old
+toolhub.exe
+
+# Log files
+*.log
+out.txt
+
+# OS / Editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
