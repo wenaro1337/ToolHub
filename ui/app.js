@@ -1957,6 +1957,9 @@ function renderNetworkTab() {
                     } else if (p.action_type === 'toggle_killswitch') {
                         actHtml = `<button onclick="toggleKillSwitchClick()" class="btn btn-primary" style="font-size: 10.5px; padding: 4px 10px; margin-top: 6px; width: 100%;">Включить фильтр</button>`;
                     }
+                    if (p.id === 'timezone') {
+                        actHtml += `<button type="button" onclick="restoreTimezoneAction()" class="btn btn-secondary" style="font-size: 10.5px; padding: 4px 10px; margin-top: 6px; width: 100%;">Вернуть исходный пояс</button>`;
+                    }
                     return `
                         <div style="background: rgba(255,255,255,0.02); border: 1px solid ${isPass ? 'rgba(16, 185, 129, 0.18)' : 'rgba(245, 158, 11, 0.2)'}; border-radius: 6px; padding: 9px; display: flex; flex-direction: column; justify-content: space-between;">
                             <div>
@@ -2043,8 +2046,9 @@ async function syncTimezoneAction(targetTz) {
 async function restoreTimezoneAction() {
     try {
         const res = await appIpc.restoreTimezone();
-        showNotification(res.message || 'Исходный часовой пояс восстановлен.', 'success', 5000);
-        logConsole(`[ТАЙМЗОНА] ${res.message || 'Восстановлено'}`);
+        const message = typeof res === 'string' ? res : res.message;
+        showNotification(message || 'Исходный часовой пояс восстановлен.', 'success', 5000);
+        logConsole(`[ТАЙМЗОНА] ${message || 'Восстановлено'}`);
         await runClaudeNetworkAudit(true);
     } catch (err) {
         showNotification(err.message || String(err), 'error', 6000);

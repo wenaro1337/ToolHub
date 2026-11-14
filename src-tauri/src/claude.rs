@@ -802,10 +802,17 @@ pub fn sync_system_timezone(iana_tz: String) -> Result<String, String> {
         // Save original timezone to backup file if not already saved
         let home = get_user_home();
         let profiles_dir = home.join(".claude-profiles");
-        let _ = fs::create_dir_all(&profiles_dir);
         let backup_file = profiles_dir.join("original_timezone.txt");
-        if !backup_file.exists() && !current_tz.is_empty() {
-            let _ = fs::write(&backup_file, &current_tz);
+        if current_tz.trim().is_empty() {
+            return Err("Не удалось определить текущий часовой пояс Windows.".to_string());
+        }
+        if current_tz.trim() == target_tz_id {
+            return Ok(format!("Часовой пояс уже установлен: {target_tz_id}"));
+        }
+        fs::create_dir_all(&profiles_dir).map_err(|e| format!("Не удалось создать папку для резервной копии: {e}"))?;
+        if !backup_file.exists() {
+            fs::write(&backup_file, &current_tz)
+                .map_err(|e| format!("Не удалось сохранить исходный часовой пояс: {e}"))?;
         }
 
         let mut cmd = Command::new("tzutil");
@@ -834,13 +841,17 @@ pub fn restore_system_timezone() -> Result<String, String> {
 
         let home = get_user_home();
         let backup_file = home.join(".claude-profiles").join("original_timezone.txt");
-        let default_restore = "Russian Standard Time".to_string();
-        let original_tz = if backup_file.exists() {
-            fs::read_to_string(&backup_file).unwrap_or(default_restore)
-        } else {
-            default_restore
-        };
+        let original_tz = fs::read_to_string(&backup_file).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "Исходный часовой пояс не сохранён.".to_string()
+            } else {
+                format!("Не удалось прочитать исходный часовой пояс: {e}")
+            }
+        })?;
         let clean_tz = original_tz.trim();
+        if clean_tz.is_empty() {
+            return Err("Сохранённый часовой пояс пуст.".to_string());
+        }
 
         let mut cmd = Command::new("tzutil");
         cmd.args(&["/s", clean_tz]);
@@ -848,6 +859,8 @@ pub fn restore_system_timezone() -> Result<String, String> {
 
         let out = cmd.output().map_err(|e| format!("Ошибка вызова tzutil: {}", e))?;
         if out.status.success() {
+            fs::remove_file(&backup_file)
+                .map_err(|e| format!("Пояс восстановлен, но не удалось удалить резервную копию: {e}"))?;
             Ok(format!("Исходный часовой пояс Windows восстановлен: '{}'", clean_tz))
         } else {
             let err = String::from_utf8_lossy(&out.stderr);
