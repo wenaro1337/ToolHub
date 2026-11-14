@@ -381,3 +381,13 @@ pub async fn clean_app_leftovers(paths: Vec<String>) -> Result<CleanLeftoversRes
 
 
 
+
+#[tauri::command]
+pub fn list_claude_profiles() -> Result<Vec<String>, String> {
+    claude::list_claude_profiles()
+}
+
+#[tauri::command]
+pub fn reset_claude_profile(name: String) -> Result<(), String> {
+    claude::reset_claude_profile(name)
+}

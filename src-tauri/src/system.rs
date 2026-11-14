@@ -520,19 +520,7 @@ fn get_startup_shortcut_path() -> Option<std::path::PathBuf> {
 }
 
 pub fn get_autostart_status() -> bool {
-    #[cfg(target_os = "windows")]
-    {
-        if is_priority_autostart_active() {
-            return true;
-        }
-        let hk = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
-        if let Ok(key) = hk.open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run") {
-            if key.get_value::<String, _>("ToolHub").is_ok() {
-                return true;
-            }
-        }
-    }
-    false
+    is_priority_autostart_active()
 }
 
 pub fn is_priority_autostart_active() -> bool {
@@ -558,49 +546,38 @@ pub fn set_priority_autostart(enabled: bool) -> Result<bool, String> {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         let current_exe = std::env::current_exe()
             .map_err(|e| format!("Не удалось определить путь к toolhub.exe: {}", e))?;
-        let exe_str = current_exe.to_string_lossy().to_string();
-
         if enabled {
-            let is_admin = crate::killswitch::is_running_as_admin();
-            if is_admin {
-                let tr_val = format!("\"{}\" --minimized", exe_str);
-                let out = Command::new("schtasks")
-                    .args(&[
-                        "/create",
-                        "/tn", "ToolHub_PriorityGuardian",
-                        "/tr", &tr_val,
-                        "/sc", "onlogon",
-                        "/rl", "highest",
-                        "/f",
-                    ])
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .output()
-                    .map_err(|e| format!("Ошибка вызова schtasks: {}", e))?;
-
-                if !out.status.success() {
-                    let err = String::from_utf8_lossy(&out.stderr);
-                    return Err(format!("Не удалось создать задачу в Планировщике: {}", err));
-                }
-
-                if let Ok(hklm) = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
-                    .open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Run", winreg::enums::KEY_SET_VALUE)
-                {
-                    let _ = hklm.set_value("ToolHub", &format!("\"{}\" --minimized", exe_str));
-                }
+            let script = r#"
+$ErrorActionPreference = 'Stop'
+$exe = $env:TOOLHUB_AUTOSTART_EXE
+$user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$action = New-ScheduledTaskAction -Execute $exe -Argument '--minimized' -WorkingDirectory (Split-Path -Parent $exe)
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+$settings = New-ScheduledTaskSettingsSet -Priority 1 -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName ToolHub_PriorityGuardian -Action $action -Trigger $trigger -Settings $settings -User $user -RunLevel Highest -Force | Out-Null
+"#;
+            let command = if crate::killswitch::is_running_as_admin() {
+                script.to_string()
             } else {
-                let ps_script = format!(
-                    "Start-Process cmd.exe -Verb RunAs -Wait -ArgumentList '/c', 'schtasks /create /tn \"ToolHub_PriorityGuardian\" /tr \"\"\"{}\"\" --minimized\" /sc onlogon /rl highest /f'",
-                    exe_str.replace("'", "''")
-                );
-                let status = Command::new("powershell")
-                    .args(&["-WindowStyle", "Hidden", "-Command", &ps_script])
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .status()
-                    .map_err(|e| format!("Ошибка вызова UAC: {}", e))?;
-
-                if !status.success() {
-                    return Err("Не удалось зарегистрировать приоритетную задачу (требуются права Администратора).".to_string());
-                }
+                format!(
+                    "$ErrorActionPreference = 'Stop'; $child = Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList '-NoProfile','-Command',{}; exit $child.ExitCode",
+                    format!("'{}'", script.trim().replace("'", "''").replace('\n', "; "))
+                )
+            };
+            let output = Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+                .env("TOOLHUB_AUTOSTART_EXE", &current_exe)
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .map_err(|e| format!("Не удалось запустить Планировщик задач: {}", e))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "Не удалось создать задачу автозапуска: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            if !is_priority_autostart_active() {
+                return Err("Не удалось подтвердить создание задачи автозапуска Windows.".to_string());
             }
             Ok(true)
         } else {
@@ -623,6 +600,9 @@ pub fn set_priority_autostart(enabled: bool) -> Result<bool, String> {
                     .creation_flags(CREATE_NO_WINDOW)
                     .status();
             }
+            if is_priority_autostart_active() {
+                return Err("Не удалось удалить задачу автозапуска Windows.".to_string());
+            }
             Ok(false)
         }
     }
@@ -633,56 +613,19 @@ pub fn set_priority_autostart(enabled: bool) -> Result<bool, String> {
 }
 
 pub fn set_autostart(enabled: bool) -> Result<bool, String> {
+    let result = set_priority_autostart(enabled)?;
     #[cfg(target_os = "windows")]
     {
-        let hk = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
-        let key = hk.open_subkey_with_flags(
+        let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+        if let Ok(key) = hkcu.open_subkey_with_flags(
             r"Software\Microsoft\Windows\CurrentVersion\Run",
-            winreg::enums::KEY_SET_VALUE | winreg::enums::KEY_QUERY_VALUE,
-        ).map_err(|e| format!("Не удалось открыть реестр Windows: {}", e))?;
-
-        let current_exe = std::env::current_exe()
-            .map_err(|e| format!("Не удалось определить путь к toolhub.exe: {}", e))?;
-        let exe_str = current_exe.to_string_lossy().to_string();
-
-        if enabled {
-            let reg_val = format!("\"{}\" --minimized", exe_str);
-            let _ = key.set_value("ToolHub", &reg_val);
-
-            // Clean up any legacy ToolHub.cmd so there is never a duplicate in Task Manager
-            if let Some(cmd_path) = get_startup_shortcut_path() {
-                let _ = std::fs::remove_file(&cmd_path);
-            }
-            if let Ok(approved_folder) = hk.open_subkey_with_flags(
-                r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder",
-                winreg::enums::KEY_SET_VALUE
-            ) {
-                let _ = approved_folder.delete_value("ToolHub.cmd");
-            }
-
-            // Attempt priority autostart (Task Scheduler with Highest runlevel)
-            let _ = set_priority_autostart(true);
-            Ok(true)
-        } else {
+            winreg::enums::KEY_SET_VALUE,
+        ) {
             let _ = key.delete_value("ToolHub");
-            if let Some(cmd_path) = get_startup_shortcut_path() {
-                let _ = std::fs::remove_file(&cmd_path);
-            }
-            if let Ok(approved_folder) = hk.open_subkey_with_flags(
-                r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder",
-                winreg::enums::KEY_SET_VALUE
-            ) {
-                let _ = approved_folder.delete_value("ToolHub.cmd");
-            }
-            let _ = set_priority_autostart(false);
-            Ok(false)
         }
     }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        Ok(enabled)
-    }
+    cleanup_legacy_startup_cmd();
+    Ok(result)
 }
 
 pub fn cleanup_legacy_startup_cmd() {

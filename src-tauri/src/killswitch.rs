@@ -110,8 +110,19 @@ pub fn load_killswitch_config() {
     }
     #[cfg(target_os = "windows")]
     {
-        if IFEO_GUARD_ACTIVE.load(Ordering::SeqCst) && !is_ifeo_guard_active() {
-            let _ = set_ifeo_guard(true);
+        if IFEO_GUARD_ACTIVE.load(Ordering::SeqCst) {
+            let result = if is_ifeo_guard_active() {
+                set_packaged_claude_startup_block(true).and_then(|_| set_packaged_claude_execute_block("1"))
+            } else {
+                set_ifeo_guard(true).map(|_| ())
+            };
+            if let Err(error) = result {
+                use std::io::Write;
+                let path = crate::local_log_path("frontend_errors.log");
+                if let Ok(mut log) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(log, "[KILLSWITCH STARTUP] {error}");
+                }
+            }
         }
     }
 }
@@ -222,14 +233,8 @@ pub fn set_allowed_ips(ips: Vec<String>) -> KillSwitchStatus {
     let strict = STRICT_MODE.load(Ordering::SeqCst);
     save_killswitch_config(enabled, &cleaned, strict);
 
-    let cur_ip = LAST_EGRESS_IP.lock().map(|s| s.clone()).unwrap_or_default();
-    let cur_country = LAST_EGRESS_COUNTRY.lock().map(|s| s.clone()).unwrap_or_default();
-    let score = LAST_ANTI_BAN_SCORE.load(Ordering::SeqCst);
-    let split = LAST_SPLIT_TUNNEL.load(Ordering::SeqCst);
-
-    if !cur_ip.is_empty() {
-        let safe_country = !is_country_restricted(&cur_country);
-        update_network_safety(safe_country, &cur_ip, &cur_country, score, split);
+    if NETWORK_IS_SAFE.load(Ordering::SeqCst) {
+        revoke_network_trust("Список доверенных IP изменился. Повторите аудит.");
     }
 
     get_killswitch_status()
@@ -242,13 +247,9 @@ pub fn set_strict_mode(strict: bool) -> KillSwitchStatus {
     let allowed_ips = ALLOWED_IPS.lock().map(|l| l.clone()).unwrap_or_default();
     save_killswitch_config(enabled, &allowed_ips, strict);
 
-    let cur_ip = LAST_EGRESS_IP.lock().map(|s| s.clone()).unwrap_or_default();
-    let cur_country = LAST_EGRESS_COUNTRY.lock().map(|s| s.clone()).unwrap_or_default();
-    let score = LAST_ANTI_BAN_SCORE.load(Ordering::SeqCst);
-    let split = LAST_SPLIT_TUNNEL.load(Ordering::SeqCst);
-
-    let safe_country = !is_country_restricted(&cur_country);
-    update_network_safety(safe_country, &cur_ip, &cur_country, score, split);
+    if NETWORK_IS_SAFE.load(Ordering::SeqCst) {
+        revoke_network_trust("Строгий режим изменился. Повторите аудит.");
+    }
 
     get_killswitch_status()
 }
@@ -526,25 +527,160 @@ pub fn set_persistent_firewall(enabled: bool) -> Result<KillSwitchStatus, String
     Ok(get_killswitch_status())
 }
 
+#[cfg(target_os = "windows")]
+const IFEO_TARGETS: [&str; 3] = ["claude.exe", "claude-desktop.exe", "cowork-svc.exe"];
+
 pub fn is_ifeo_guard_active() -> bool {
     #[cfg(target_os = "windows")]
     {
         use winreg::enums::*;
         use winreg::RegKey;
 
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        let expected = format!("\"{}\" --blocked-by-ifeo", exe.display());
         let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-        let path = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\claude.exe";
-        if let Ok(key) = hklm.open_subkey_with_flags(path, KEY_READ) {
-            if let Ok(val) = key.get_value::<String, _>("Debugger") {
-                return !val.is_empty() && val.to_lowercase().contains("toolhub");
-            }
-        }
-        false
+        IFEO_TARGETS.iter().all(|target| {
+            let path = format!(
+                r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\{}",
+                target
+            );
+            hklm.open_subkey_with_flags(path, KEY_READ | KEY_WOW64_64KEY)
+                .and_then(|key| key.get_value::<String, _>("Debugger"))
+                .is_ok_and(|value| value.eq_ignore_ascii_case(&expected))
+        })
     }
     #[cfg(not(target_os = "windows"))]
     {
         false
     }
+}
+
+#[cfg(target_os = "windows")]
+fn set_packaged_claude_execute_block(mode: &str) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", include_str!("claude_execute_guard.ps1")])
+        .env("TOOLHUB_EXECUTE_BLOCK", mode)
+        .creation_flags(0x08000000)
+        .output()
+        .map_err(|e| format!("Не удалось настроить разрешения Claude: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("Не удалось настроить разрешения Claude: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn set_packaged_claude_startup_block(blocked: bool) -> Result<(), String> {
+    use std::io::ErrorKind;
+    use std::os::windows::process::CommandExt;
+    use winreg::{enums::*, RegKey};
+
+    const SAVED_START: &str = "ToolHubPreviousStart";
+    let user = RegKey::predef(HKEY_CURRENT_USER);
+    let startup = r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\SystemAppData\Claude_pzs8sxrjxfjjc\ClaudeStartup";
+    match user.open_subkey_with_flags(startup, KEY_READ | KEY_SET_VALUE) {
+        Ok(key) => {
+            let saved = key.get_value::<u32, _>("ToolHubPreviousState");
+            if blocked {
+                let state = key.get_value::<u32, _>("State")
+                    .map_err(|e| format!("Не удалось прочитать автозапуск Claude: {e}"))?;
+                if state == 2 || state == 4 {
+                    if let Err(e) = saved {
+                        if e.kind() != ErrorKind::NotFound {
+                            return Err(format!("Не удалось прочитать сохранённый режим Claude: {e}"));
+                        }
+                        key.set_value("ToolHubPreviousState", &state)
+                            .map_err(|e| format!("Не удалось сохранить режим Claude: {e}"))?;
+                    }
+                    key.set_value("State", &3u32)
+                        .map_err(|e| format!("Не удалось отключить автозапуск Claude: {e}"))?;
+                }
+            } else {
+                match saved {
+                    Ok(state) => {
+                        key.set_value("State", &state)
+                            .and_then(|_| key.delete_value("ToolHubPreviousState"))
+                            .map_err(|e| format!("Не удалось восстановить автозапуск Claude: {e}"))?;
+                    }
+                    Err(e) if e.kind() == ErrorKind::NotFound => {},
+                    Err(e) => return Err(format!("Не удалось прочитать сохранённый режим Claude: {e}")),
+                }
+            }
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {},
+        Err(e) => return Err(format!("Не удалось открыть настройки автозапуска Claude: {e}")),
+    }
+
+    let machine = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let service = match machine.open_subkey_with_flags(
+        r"SYSTEM\CurrentControlSet\Services\CoworkVMService",
+        KEY_READ | KEY_SET_VALUE,
+    ) {
+        Ok(key) => key,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("Не удалось открыть настройки службы Cowork: {e}")),
+    };
+    let previous = match service.get_value::<u32, _>(SAVED_START) {
+        Ok(value) => Some(value),
+        Err(e) if e.kind() == ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("Не удалось прочитать исходный режим службы Cowork: {e}")),
+    };
+    let current = service.get_value::<u32, _>("Start")
+        .map_err(|e| format!("Не удалось прочитать режим службы Cowork: {e}"))?;
+    let (mode, expected) = if blocked {
+        if current == 4 {
+            return Ok(());
+        }
+        if previous.is_none() {
+            service.set_value(SAVED_START, &current)
+                .map_err(|e| format!("Не удалось сохранить режим службы Cowork: {e}"))?;
+        }
+        ("disabled", 4u32)
+    } else {
+        match previous {
+            Some(2) => ("auto", 2),
+            Some(3) => ("demand", 3),
+            Some(4) => ("disabled", 4),
+            None => return Ok(()),
+            _ => return Err("Неизвестный исходный режим службы Cowork".to_string()),
+        }
+    };
+
+    let output = Command::new("sc.exe")
+        .args(["config", "CoworkVMService", "start=", mode])
+        .creation_flags(0x08000000)
+        .output()
+        .map_err(|e| format!("Не удалось настроить службу Cowork: {e}"))?;
+    if !output.status.success() {
+        if output.status.code() != Some(5) {
+            return Err(format!("Не удалось настроить службу Cowork: {}", output.status));
+        }
+        // Packaged services may deny SERVICE_CHANGE_CONFIG even when their
+        // persistent startup settings are writable. SCM may cache the old mode
+        // until Windows restarts.
+        service.set_value("Start", &expected)
+            .map_err(|e| format!("Не удалось сохранить режим запуска Cowork: {e}"))?;
+        use std::io::Write;
+        if let Ok(mut log) = std::fs::OpenOptions::new().create(true).append(true)
+            .open(crate::local_log_path("frontend_debug.log"))
+        {
+            let _ = writeln!(log, "[KILLSWITCH STARTUP] Cowork startup mode saved in registry; Windows restart may be required");
+        }
+    }
+    let saved = service.get_value::<u32, _>("Start")
+        .map_err(|e| format!("Не удалось проверить режим службы Cowork: {e}"))?;
+    if saved != expected {
+        return Err(format!("Windows сохранила режим Cowork {saved} вместо {expected}"));
+    }
+    if !blocked {
+        service.delete_value(SAVED_START)
+            .map_err(|e| format!("Не удалось удалить сохранённый режим службы Cowork: {e}"))?;
+    }
+    Ok(())
 }
 
 pub fn set_ifeo_guard(enabled: bool) -> Result<KillSwitchStatus, String> {
@@ -555,15 +691,19 @@ pub fn set_ifeo_guard(enabled: bool) -> Result<KillSwitchStatus, String> {
 
         let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
         let base_path = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options";
-        let targets = ["claude.exe", "claude-desktop.exe", "cowork-svc.exe"];
+        let hklm = hklm.open_subkey_with_flags(base_path, KEY_READ | KEY_WRITE | KEY_WOW64_64KEY)
+            .map_err(|e| format!("Не удалось открыть IFEO: {}", e))?;
+
+        set_packaged_claude_startup_block(enabled)?;
+        set_packaged_claude_execute_block(if enabled { "1" } else { "0" })?;
 
         if enabled {
             let current_exe = std::env::current_exe()
                 .map_err(|e| format!("Не удалось определить путь к ToolHub: {}", e))?;
             let debugger_val = format!("\"{}\" --blocked-by-ifeo", current_exe.to_string_lossy());
 
-            for target in targets.iter() {
-                let key_path = format!("{}\\{}", base_path, target);
+            for target in IFEO_TARGETS {
+                let key_path = target;
                 let (key, _) = hklm.create_subkey(&key_path)
                     .map_err(|e| format!("Ошибка создания ключа IFEO для {}: {}. Нужны права администратора.", target, e))?;
                 key.set_value("Debugger", &debugger_val)
@@ -571,8 +711,8 @@ pub fn set_ifeo_guard(enabled: bool) -> Result<KillSwitchStatus, String> {
             }
             IFEO_GUARD_ACTIVE.store(true, Ordering::SeqCst);
         } else {
-            for target in targets.iter() {
-                let key_path = format!("{}\\{}", base_path, target);
+            for target in IFEO_TARGETS {
+                let key_path = target;
                 if let Ok(key) = hklm.open_subkey_with_flags(&key_path, KEY_SET_VALUE) {
                     let _ = key.delete_value("Debugger");
                 }
@@ -602,10 +742,9 @@ pub fn pause_ifeo_guard_temporary() {
         use winreg::RegKey;
         let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
         let base_path = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options";
-        let targets = ["claude.exe", "claude-desktop.exe", "cowork-svc.exe"];
-        for target in targets.iter() {
+        for target in IFEO_TARGETS {
             let key_path = format!("{}\\{}", base_path, target);
-            if let Ok(key) = hklm.open_subkey_with_flags(&key_path, KEY_SET_VALUE) {
+            if let Ok(key) = hklm.open_subkey_with_flags(key_path, KEY_SET_VALUE | KEY_WOW64_64KEY) {
                 let _ = key.delete_value("Debugger");
             }
         }
@@ -673,20 +812,8 @@ pub fn start_kernel_route_watcher() {
                 if res == 0 {
                     // Route table changed (VPN tunnel dropped, interface flapped, or default gateway changed)
                     if KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
-                        let log_path = crate::local_log_path("frontend_debug.log");
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
-                            use std::io::Write;
-                            let _ = writeln!(f, "[KERNEL WATCHDOG] Network route change detected! Preemptively freezing Claude processes...");
-                        }
-
-                        // 1. Immediately drop safety flag in RAM so any pending thread/action is locked
-                        NETWORK_IS_SAFE.store(false, Ordering::SeqCst);
-
-                        // 2. Immediately enable firewall block rule at WFP level
-                        enable_firewall_block_rule();
-
-                        // 3. Preemptively freeze and obliterate Claude before any socket can rebind or leak packets!
-                        kill_all_claude_processes("Мгновенный аппаратный перехват: обрыв маршрута VPN / мерцание интерфейса (Kernel Route Drop)");
+                        let stopped = revoke_network_trust("Сетевой маршрут изменился");
+                        log_claude_guard_event("route_changed", Some(stopped));
                     }
                     thread::sleep(Duration::from_millis(500));
                 } else {
@@ -823,21 +950,16 @@ pub fn kill_all_claude_processes(reason: &str) -> u32 {
 // Background Guardian loop (50ms reaction time + Kernel Route Watcher - 100% OFFLINE STEALTH)
 pub fn start_killswitch_guardian() {
     load_killswitch_config();
-    setup_firewall_armor();
-    start_kernel_route_watcher();
 
     thread::spawn(|| {
         let mut sys = System::new();
 
         loop {
-            thread::sleep(Duration::from_millis(50));
-
             let enabled = KILLSWITCH_ENABLED.load(Ordering::SeqCst);
             let safe = NETWORK_IS_SAFE.load(Ordering::SeqCst);
 
             // Process Gatekeeper: if KillSwitch is enabled and network is unsafe, freeze & kill instantly!
             if enabled && !safe {
-                enable_firewall_block_rule();
                 sys.refresh_processes(ProcessesToUpdate::All);
                 for (pid, process) in sys.processes() {
                     let name = process.name().to_string_lossy().to_string();
@@ -849,7 +971,9 @@ pub fn start_killswitch_guardian() {
 
                     if is_claude {
                         let pid_num = pid.as_u32();
-                        let _ = atomic_freeze_and_terminate(pid_num);
+                        if !atomic_freeze_and_terminate(pid_num) {
+                            continue;
+                        }
 
                         let now = chrono::Local::now().timestamp();
                         let last_pid = LAST_ALERT_PID.load(Ordering::SeqCst);
@@ -902,13 +1026,70 @@ pub fn start_killswitch_guardian() {
                         }
                     }
                 }
+                if !NETWORK_IS_SAFE.load(Ordering::SeqCst) {
+                    enable_firewall_block_rule();
+                }
             }
+            thread::sleep(Duration::from_millis(50));
         }
     });
+
+    setup_firewall_armor();
+    start_kernel_route_watcher();
 }
 
 // Update the safety state from network audit
+static GUARD_LOG_APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+pub fn connect_guard_log(app: &tauri::AppHandle) {
+    let _ = GUARD_LOG_APP.set(app.clone());
+}
+
+fn log_claude_guard_event(event: &'static str, stopped: Option<u32>) {
+    use std::io::Write;
+
+    use tauri::Emitter;
+    let message = match event {
+        "audit_passed" => "Сетевой аудит пройден",
+        "audit_blocked" => "Сетевой аудит не пройден",
+        "egress_changed" => "Внешний IP изменился, доверие сброшено",
+        "route_changed" => "Сетевой маршрут изменился, доверие сброшено",
+        "desktop_started" => "Claude Desktop запущен",
+        "desktop_launch_denied_or_failed" => "Запуск Claude Desktop заблокирован или завершился ошибкой",
+        "cli_launch_requested" => "Запрошен запуск Claude Code",
+        "cli_launch_denied_or_failed" => "Запуск Claude Code заблокирован или завершился ошибкой",
+        "cowork_service_start_accepted" => "Windows приняла команду запуска Cowork",
+        _ => "Неизвестная команда запуска",
+    };
+    if let Some(app) = GUARD_LOG_APP.get() {
+        let count = stopped.map(|count| format!(". Завершено процессов: {count}")).unwrap_or_default();
+        let time = chrono::Local::now().format("%H:%M:%S");
+        let _ = app.emit("claude-guard-log", format!("[CLAUDE] {time} {message}{count}"));
+    }
+
+    let path = crate::local_log_path("claude-guard.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let count = stopped.map(|count| format!(" stopped={count}")).unwrap_or_default();
+        let _ = writeln!(file, "{time} {event}{count}");
+    }
+}
+
+pub(crate) fn revoke_network_trust(reason: &str) -> u32 {
+    NETWORK_IS_SAFE.store(false, Ordering::SeqCst);
+    if !KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
+        return 0;
+    }
+
+    enable_firewall_block_rule();
+    let stopped = kill_all_claude_processes(reason);
+    resume_ifeo_guard_temporary();
+    stopped
+}
+
 pub fn update_network_safety(safe: bool, ip: &str, country: &str, anti_ban_score: u32, split_tunnel: bool) {
+    let ip_changed = NETWORK_IS_SAFE.load(Ordering::SeqCst)
+        && LAST_EGRESS_IP.lock().is_ok_and(|previous| previous.as_str() != ip);
     if let Ok(mut l_ip) = LAST_EGRESS_IP.lock() {
         *l_ip = ip.to_string();
     }
@@ -933,13 +1114,14 @@ pub fn update_network_safety(safe: bool, ip: &str, country: &str, anti_ban_score
         anti_ban_score >= 40
     };
 
-    let effective_safe = !country_restricted && safe && ip_matches && score_ok && !ip.is_empty();
+    let effective_safe = !ip_changed && !country_restricted && safe && ip_matches && score_ok && !ip.is_empty();
     NETWORK_IS_SAFE.store(effective_safe, Ordering::SeqCst);
 
     // If transitioned to unsafe, kill any active Claude immediately
     if !effective_safe && KILLSWITCH_ENABLED.load(Ordering::SeqCst) {
-        enable_firewall_block_rule();
-        let reason = if country_restricted {
+        let reason = if ip_changed {
+            format!("Исходящий IP изменился на {ip}. Требуется повторная проверка сети.")
+        } else if country_restricted {
             format!("Сетевой аудит: обнаружен выход из санкционной юрисдикции ({}: {}). Claude заблокирован.", country, ip)
         } else if !ip_matches {
             format!("Сетевой аудит: IP {} не входит в белый список разрешённых IP ({})", ip, allowed_ips.join(", "))
@@ -950,7 +1132,10 @@ pub fn update_network_safety(safe: bool, ip: &str, country: &str, anti_ban_score
         } else {
             format!("Сетевой аудит: Антибан-индекс ({} / 100) ниже допустимого порога. Запуск Claude заблокирован.", anti_ban_score)
         };
-        kill_all_claude_processes(&reason);
+        let stopped = revoke_network_trust(&reason);
+        log_claude_guard_event(if ip_changed { "egress_changed" } else { "audit_blocked" }, Some(stopped));
+    } else if effective_safe {
+        log_claude_guard_event("audit_passed", None);
     }
 }
 
@@ -1037,7 +1222,42 @@ pub fn set_killswitch_enabled(enabled: bool) -> KillSwitchStatus {
 }
 
 // Safe launcher for Claude Desktop or Claude CLI
+#[cfg(target_os = "windows")]
+fn wait_for_claude_process(names: &[&str]) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut processes = System::new();
+    loop {
+        if KILLSWITCH_ENABLED.load(Ordering::SeqCst) && !NETWORK_IS_SAFE.load(Ordering::SeqCst) {
+            return Err("Сеть изменилась во время запуска. Повторите аудит.".to_string());
+        }
+        processes.refresh_processes(ProcessesToUpdate::All);
+        if processes.processes().values().any(|process| {
+            let name = process.name().to_string_lossy();
+            names.iter().any(|expected| name.eq_ignore_ascii_case(expected))
+        }) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("Windows не запустила {} за 15 секунд.", names.join(" / ")));
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
 pub fn safe_launch_claude(launch_type: &str, profile_name: Option<String>) -> Result<String, String> {
+    let result = launch_claude(launch_type, profile_name);
+    let event = match (launch_type, result.is_ok()) {
+        ("desktop", true) => "desktop_started",
+        ("desktop", false) => "desktop_launch_denied_or_failed",
+        ("cli", true) => "cli_launch_requested",
+        ("cli", false) => "cli_launch_denied_or_failed",
+        _ => "unknown_launch_request",
+    };
+    log_claude_guard_event(event, None);
+    result
+}
+
+fn launch_claude(launch_type: &str, profile_name: Option<String>) -> Result<String, String> {
     let enabled = KILLSWITCH_ENABLED.load(Ordering::SeqCst);
     let safe = NETWORK_IS_SAFE.load(Ordering::SeqCst);
     let allowed_ips = ALLOWED_IPS.lock().map(|l| l.clone()).unwrap_or_default();
@@ -1077,10 +1297,50 @@ pub fn safe_launch_claude(launch_type: &str, profile_name: Option<String>) -> Re
         pause_ifeo_guard_temporary();
     }
 
+    #[cfg(target_os = "windows")]
+    if was_ifeo && matches!(launch_type, "desktop" | "cli") {
+        let mode = if launch_type == "desktop" { "desktop-launch" } else { "cli-launch" };
+        if let Err(error) = set_packaged_claude_execute_block(mode) {
+            resume_ifeo_guard_temporary();
+            return Err(error);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    if was_ifeo && launch_type == "desktop" && find_cowork_svc_path().is_some() {
+        use std::os::windows::process::CommandExt;
+
+        disable_firewall_block_rule();
+        let cowork = set_packaged_claude_startup_block(false).and_then(|_| {
+            let output = Command::new("sc.exe")
+                .args(["start", "CoworkVMService"])
+                .creation_flags(0x08000000)
+                .output()
+                .map_err(|e| format!("Не удалось запустить Cowork: {e}"))?;
+            if output.status.success() || output.status.code() == Some(1056) {
+                log_claude_guard_event("cowork_service_start_accepted", None);
+                wait_for_claude_process(&["cowork-svc.exe"])
+            } else {
+                Err(format!("Служба Cowork не запустилась: {}", output.status))
+            }
+        });
+        if let Err(error) = cowork {
+            enable_firewall_block_rule();
+            resume_ifeo_guard_temporary();
+            kill_all_claude_processes("Разрешённый запуск Cowork не удался");
+            return Err(error);
+        }
+    }
+
+    if enabled && !NETWORK_IS_SAFE.load(Ordering::SeqCst) {
+        revoke_network_trust("Сеть изменилась во время разрешённого запуска");
+        return Err("Сеть изменилась. Повторите аудит перед запуском Claude.".to_string());
+    }
+
     // Network is verified safe: momentarily open firewall armor for sanctioned launch
     disable_firewall_block_rule();
 
-    let launch_res = match launch_type {
+    let launch_res = (|| match launch_type {
         "desktop" => {
             if let Some(path) = find_claude_desktop_path() {
                 #[cfg(target_os = "windows")]
@@ -1092,11 +1352,15 @@ pub fn safe_launch_claude(launch_type: &str, profile_name: Option<String>) -> Re
                     let spawn_res = cmd.spawn();
                     if spawn_res.is_err() {
                         // MSIX fallback: launch via explorer shell:AppsFolder
-                        let _ = Command::new("explorer")
+                        Command::new("explorer")
                             .arg("shell:AppsFolder\\Claude_pzs8sxrjxfjjc!Claude")
-                            .spawn();
+                            .spawn()
+                            .map_err(|e| format!("Не удалось запросить запуск Claude Desktop: {e}"))?;
+                        wait_for_claude_process(&["claude.exe", "claude-desktop.exe"])?;
+                        return Ok("Claude Desktop запущен.".to_string());
                     }
-                    Ok("Claude Desktop успешно запущен в защищённом периметре.".to_string())
+                    wait_for_claude_process(&["claude.exe", "claude-desktop.exe"])?;
+                    Ok("Claude Desktop запущен.".to_string())
                 }
                 #[cfg(not(target_os = "windows"))]
                 {
@@ -1111,7 +1375,8 @@ pub fn safe_launch_claude(launch_type: &str, profile_name: Option<String>) -> Re
                         .arg("shell:AppsFolder\\Claude_pzs8sxrjxfjjc!Claude")
                         .spawn();
                     if shell_res.is_ok() {
-                        return Ok("Claude Desktop успешно запущен в защищённом периметре.".to_string());
+                        wait_for_claude_process(&["claude.exe", "claude-desktop.exe"])?;
+                        return Ok("Claude Desktop запущен.".to_string());
                     }
                 }
                 Err("Приложение Claude Desktop не найдено по стандартным путям. Убедитесь, что официальный десктопный клиент установлен.".to_string())
@@ -1120,6 +1385,9 @@ pub fn safe_launch_claude(launch_type: &str, profile_name: Option<String>) -> Re
         "cli" => {
             let name = profile_name.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "default".to_string());
             let home = crate::claude::get_user_home();
+            if !crate::claude::valid_profile_name(&name) {
+                return Err("Недопустимое имя профиля.".to_string());
+            }
             let profile_dir = home.join(".claude-profiles").join(&name);
             let bat_path = profile_dir.join(format!("run_{}.bat", name));
 
@@ -1145,14 +1413,24 @@ pub fn safe_launch_claude(launch_type: &str, profile_name: Option<String>) -> Re
             }
         }
         _ => Err("Неизвестный тип запуска. Используйте 'desktop' или 'cli'.".to_string())
-    };
+    })();
 
     if was_ifeo {
-        thread::spawn(|| {
-            thread::sleep(Duration::from_millis(1500));
+        if launch_res.is_ok() {
+            schedule_guard_restore();
+        } else {
+            enable_firewall_block_rule();
             resume_ifeo_guard_temporary();
-        });
+            kill_all_claude_processes("Разрешённый запуск Claude не удался");
+        }
     }
 
     launch_res
+}
+
+fn schedule_guard_restore() {
+    thread::spawn(|| {
+        thread::sleep(Duration::from_millis(1500));
+        resume_ifeo_guard_temporary();
+    });
 }

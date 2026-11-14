@@ -51,6 +51,7 @@ pub fn run(start_minimized: bool) {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(state)
         .setup(move |app| {
+            killswitch::connect_guard_log(app.handle());
             let log_path = crate::local_log_path("frontend_debug.log");
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
                 use std::io::Write;
@@ -147,13 +148,6 @@ pub fn run(start_minimized: bool) {
 
             let _ = tray_builder.build(app)?;
 
-            // If started with --minimized flag (e.g. from autostart), hide main window
-            if start_minimized {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.hide();
-                }
-            }
-
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -167,6 +161,8 @@ pub fn run(start_minimized: bool) {
             commands::open_claude_folder,
             commands::audit_claude_network,
             commands::generate_claude_profile,
+            commands::list_claude_profiles,
+            commands::reset_claude_profile,
             commands::sync_system_timezone,
             commands::restore_system_timezone,
             commands::get_current_system_timezone,
@@ -223,7 +219,15 @@ pub fn run(start_minimized: bool) {
         let _ = writeln!(f, "[{}] [RUST] Calling builder.run()...", chrono::Local::now().format("%H:%M:%S%.3f"));
     }
 
-    let res = builder.run(tauri::generate_context!());
+    let mut context = tauri::generate_context!();
+    if start_minimized {
+        for window in &mut context.config_mut().app.windows {
+            if window.label == "main" {
+                window.visible = false;
+            }
+        }
+    }
+    let res = builder.run(context);
 
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
         use std::io::Write;

@@ -437,17 +437,20 @@ const appIpc = {
     },
 
     async safeLaunchClaude(launchType, profileName = null) {
+        if (this.isTauri()) {
+            return this.invoke('safe_launch_claude', { launchType, profileName });
+        }
         return this.invoke('safe_launch_claude', { launchType, profileName }, async () => {
             const res = await fetch(`${API_BASE}/api/claude/safe_launch`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ launch_type: launchType, profile_name: profileName })
+                body: JSON.stringify({ type: launchType, profile: profileName })
             });
             if (!res.ok) {
                 const errData = await res.json().catch(() => ({}));
                 throw new Error(errData.error || `HTTP ${res.status}`);
             }
-            return await res.json();
+            return (await res.json()).message;
         });
     },
 
@@ -1683,7 +1686,7 @@ async function safeLaunchClaudeClick(type) {
 
     try {
         showNotification(`Безопасный запуск Claude (${type === 'desktop' ? 'Desktop' : 'CLI'})...`, 'info', 3000);
-        const res = await appIpc.safeLaunchClaude(type);
+        const res = await appIpc.safeLaunchClaude(type, type === "cli" ? localStorage.getItem("claude-active-profile") : null);
         showNotification(res || 'Claude успешно запущен под защитой Kill-Switch!', 'success', 5000, 'Успешный старт');
         logConsole(`[KILLSWITCH] Safe Launch: ${type} -> ${res}`);
     } catch (err) {
@@ -1880,15 +1883,14 @@ function renderNetworkTab() {
         `;
     }
 
+    const blocked = killSwitchStatus?.enabled && !killSwitchStatus.network_safe;
     const isCritical = a.risk_level === 'critical' || a.is_restricted_country;
     const isWarning = a.risk_level === 'warning' || a.split_tunnel_detected;
-    const heroClass = isCritical ? 'critical' : isWarning ? 'warning' : 'safe';
-    const heroColor = isCritical ? '#f87171' : isWarning ? '#fbbf24' : '#34d399';
-    const statusTitle = isCritical 
-        ? 'РИСК: САНКЦИОННАЯ ЗОНА' 
-        : isWarning 
-            ? 'ТРЕБУЕТСЯ НАСТРОЙКА' 
-            : 'БЕЗОПАСНО: ДОПУСТИМЫЙ ШЛЮЗ';
+    const heroClass = blocked || isCritical ? 'critical' : isWarning ? 'warning' : 'safe';
+    const heroColor = blocked || isCritical ? '#f87171' : isWarning ? '#fbbf24' : '#34d399';
+    const statusTitle = blocked ? 'ЗАПУСК ЗАБЛОКИРОВАН' : isCritical
+        ? 'РИСК: ОГРАНИЧЕННЫЙ РЕГИОН'
+        : isWarning ? 'ТРЕБУЕТСЯ НАСТРОЙКА' : 'АУДИТ ПРОЙДЕН';
 
     const localTz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Не определено';
     const tzMismatch = localTz !== a.timezone;
@@ -1899,17 +1901,19 @@ function renderNetworkTab() {
         <div class="claude-trust-hero ${heroClass}">
             <div style="display: flex; flex-direction: column; gap: 6px;">
                 <div style="display: flex; align-items: center; gap: 8px;">
-                    <span class="mini-tag ${isCritical ? 'mini-tag-red' : isWarning ? 'mini-tag-amber' : 'mini-tag-emerald'}" style="font-size: 9.5px; font-weight: 700;">
+                    <span class="mini-tag ${blocked || isCritical ? 'mini-tag-red' : isWarning ? 'mini-tag-amber' : 'mini-tag-emerald'}" style="font-size: 9.5px; font-weight: 700;">
                         ${statusTitle}
                     </span>
-                    <span style="font-size: 11px; color: var(--text-dim);">Оценка готовности окружения</span>
+                    <span style="font-size: 11px; color: var(--text-dim);">Результат последнего аудита</span>
                 </div>
                 <div style="font-size: 14px; font-weight: 600; color: #f4f4f5;">
-                    ${isCritical 
-                        ? 'Выходной IP находится в санкционной зоне (Россия / СНГ). Вход на claude.ai вызовет блокировку.' 
-                        : isWarning 
-                            ? 'Параметры безопасности требуют оптимизации (синхронизируйте таймзону или сбросьте HWID).' 
-                            : 'Сетевое окружение безопасно: чистый VPN-шлюз, HWID изолирован, часовой пояс синхронизирован.'}
+                    ${blocked
+                        ? 'Для запуска Claude нужен новый успешный сетевой аудит.'
+                        : isCritical
+                            ? 'Последний аудит выявил ограниченный регион.'
+                            : isWarning
+                                ? 'Последний аудит выявил проблемы с настройками.'
+                                : 'Последняя проверка сетевого шлюза пройдена.'}
                 </div>
                 <div style="display: flex; gap: 8px; margin-top: 6px; align-items: center; flex-wrap: wrap;">
                     <button onclick="runClaudeNetworkAudit(true)" class="btn btn-secondary" style="font-size: 11px; padding: 5px 12px;">
@@ -2015,10 +2019,9 @@ async function runClaudeNetworkAudit(force = false) {
         try {
             killSwitchStatus = await appIpc.getKillSwitchStatus();
         } catch (e) {}
-        logConsole(`[CLAUDE SENTINEL] Аудит завершён: IP=${audit.egress_ip} (${audit.egress_loc}), Trust Score=${audit.trust_score}/100`);
     } catch (err) {
         showNotification(`Сетевой аудит: ${err.message || err}`, 'error', 7000);
-        logConsole(`[CLAUDE SENTINEL ОШИБКА] ${err.message || err}`);
+        logConsole("[CLAUDE] [ОШИБКА] Не удалось завершить сетевой аудит.");
     } finally {
         claudeAuditLoading = false;
         renderClaudeDashboard();
@@ -2244,9 +2247,53 @@ function openClaudeFolder() {
 // --------------------------------------------------------------------------
 // TAB 3: PROFILES ISOLATION & ENV SCRIPT GENERATOR
 // --------------------------------------------------------------------------
+async function loadClaudeProfileList(container) {
+    try {
+        const names = await appIpc.invoke("list_claude_profiles");
+        if (!container.isConnected) return;
+        const select = container.querySelector("select");
+        const active = localStorage.getItem("claude-active-profile") || "default";
+        select.replaceChildren(...[...new Set(["default", ...names])].map(name => new Option(name, name)));
+        select.value = names.includes(active) ? active : "default";
+        localStorage.setItem("claude-active-profile", select.value);
+        const reset = container.querySelector("button");
+        const update = () => { reset.disabled = !names.includes(select.value); };
+        select.onchange = () => {
+            localStorage.setItem("claude-active-profile", select.value);
+            update();
+        };
+        reset.onclick = async () => {
+            const name = select.value;
+            if (!confirm(`Закрой Claude Code. Сбросить профиль «${name}»? Старые данные сохранятся в резервной копии.`)) return;
+            reset.disabled = true;
+            try {
+                await appIpc.invoke("reset_claude_profile", { name });
+                showNotification("Профиль сброшен. Резервная копия сохранена.", "success");
+            } catch (error) {
+                showNotification(error.message || String(error), "error");
+            } finally {
+                update();
+            }
+        };
+        update();
+    } catch (error) {
+        container.querySelector("small").textContent = "Не удалось загрузить список профилей.";
+    }
+}
+
 function renderProfilesTab() {
+    requestAnimationFrame(() => {
+        const list = document.getElementById("claude-profile-list");
+        if (list) loadClaudeProfileList(list);
+    });
     const detectedTz = (claudeAuditData && claudeAuditData.timezone) ? claudeAuditData.timezone : null;
     return `
+        <div id="claude-profile-list" class="spec-card" style="margin-bottom: 12px;">
+            <label for="claude-active-profile">Активный профиль Claude Code</label>
+            <select id="claude-active-profile" class="input-text"></select>
+            <button type="button" class="btn btn-secondary" disabled>Сбросить профиль</button>
+            <small></small>
+        </div>
         <div class="specs-grid">
             <div class="spec-card" style="grid-column: 1 / -1;">
                 <div class="spec-card-header">
@@ -2323,6 +2370,9 @@ async function createClaudeProfileClick() {
     try {
         const res = await appIpc.generateClaudeProfile(name, detectedTz);
         if (res && res.success) {
+            localStorage.setItem("claude-active-profile", res.profile_name);
+            const list = document.getElementById("claude-profile-list");
+            if (list) loadClaudeProfileList(list);
             wrap.style.display = 'block';
             wrap.innerHTML = `
                 <div style="background: rgba(16, 185, 129, 0.05); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: 8px; padding: 14px;">
@@ -2845,6 +2895,10 @@ document.addEventListener('keydown', (e) => {
 // 7. Initial Initialization (Immediate & Resilient)
 // --------------------------------------------------------------------------
 function initApp() {
+    window.__TAURI__?.event?.listen("claude-guard-log", ({ payload }) => {
+        logConsole(payload);
+    }).catch(() => {});
+
     // Начальная инициализация текстов под целевую платформу (Windows / macOS)
     updatePlatformTexts();
 

@@ -408,7 +408,11 @@ pub fn get_current_system_timezone() -> String {
 }
 
 pub fn audit_claude_network() -> Result<ClaudeNetworkAudit, String> {
-    audit_claude_network_internal(None)
+    let result = audit_claude_network_internal(None);
+    if result.is_err() {
+        crate::killswitch::revoke_network_trust("Сетевой аудит завершился ошибкой");
+    }
+    result
 }
 
 pub fn test_custom_proxy(proxy_url: String) -> Result<ClaudeNetworkAudit, String> {
@@ -725,7 +729,9 @@ fn audit_claude_network_internal(proxy: Option<&str>) -> Result<ClaudeNetworkAud
 
     // Synchronize network safety state with the KillSwitch
     let is_network_safe = !is_restricted && p3_score >= 15;
-    crate::killswitch::update_network_safety(is_network_safe, &egress_ip, &country_name, anti_ban_index, split_tunnel_detected);
+    if proxy.is_none() {
+        crate::killswitch::update_network_safety(is_network_safe, &egress_ip, &country_name, anti_ban_index, split_tunnel_detected);
+    }
 
     Ok(ClaudeNetworkAudit {
         egress_ip,
@@ -901,7 +907,7 @@ pub fn generate_claude_profile(profile_name: String, target_tz: Option<String>) 
 
     let config_path = target_dir.join(".claude.json");
     if let Ok(serialized) = serde_json::to_string_pretty(&config) {
-        let _ = fs::write(&config_path, serialized);
+        fs::write(&config_path, serialized).map_err(|e| e.to_string())?;
     }
 
     let target_path_str = target_dir.to_string_lossy().to_string();
@@ -932,8 +938,8 @@ pub fn generate_claude_profile(profile_name: String, target_tz: Option<String>) 
         target_path_str, sh_tz_line, clean_name, tz_echo
     );
 
-    let _ = fs::write(target_dir.join(format!("run_{}.bat", clean_name)), &bat_script);
-    let _ = fs::write(target_dir.join(format!("run_{}.sh", clean_name)), &sh_script);
+    fs::write(target_dir.join(format!("run_{}.bat", clean_name)), &bat_script).map_err(|e| e.to_string())?;
+    fs::write(target_dir.join(format!("run_{}.sh", clean_name)), &sh_script).map_err(|e| e.to_string())?;
 
     Ok(ClaudeProfileResult {
         success: true,
@@ -946,4 +952,47 @@ pub fn generate_claude_profile(profile_name: String, target_tz: Option<String>) 
         target_tz: if !tz_trimmed.is_empty() { Some(tz_trimmed) } else { None },
         error: None,
     })
+}
+
+pub fn list_claude_profiles() -> Result<Vec<String>, String> {
+    let root = get_user_home().join(".claude-profiles");
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if entry.file_type().map_err(|e| e.to_string())?.is_dir()
+            && valid_profile_name(&name)
+            && entry.path().join(format!("run_{name}.bat")).is_file()
+        {
+            names.push(name);
+        }
+    }
+    names.sort();
+    Ok(names)
+}
+
+pub(crate) fn valid_profile_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+}
+
+pub fn reset_claude_profile(name: String) -> Result<(), String> {
+    if !list_claude_profiles()?.contains(&name) {
+        return Err("Профиль не найден.".to_string());
+    }
+    let root = get_user_home().join(".claude-profiles");
+    let profile = root.join(&name);
+    let backup = root.join(format!(".backup-{}-{}", name, Uuid::new_v4()));
+    fs::rename(&profile, &backup).map_err(|e| format!("Не удалось сохранить копию профиля: {e}"))?;
+    if let Err(error) = generate_claude_profile(name, None) {
+        return match fs::rename(&backup, &profile) {
+            Ok(()) => Err(error),
+            Err(restore) => Err(format!("{error}. Копия сохранена в {}. Ошибка восстановления: {restore}", backup.display())),
+        };
+    }
+    Ok(())
 }
