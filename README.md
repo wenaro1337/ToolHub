@@ -1,7 +1,5 @@
 <div align="center">
 
-<img src="docs/assets/cover.svg" width="760" alt="ToolHub">
-
 <img src="ui/icon.png" width="80" height="80" alt="ToolHub">
 
 # ToolHub
